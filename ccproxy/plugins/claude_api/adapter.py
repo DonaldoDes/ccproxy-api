@@ -82,6 +82,7 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
 
         # Filter thinking blocks from message history (they should not be sent back to API)
         body_data = self._filter_thinking_blocks_from_history(body_data)
+        logger.info("thinking_blocks_filtered", message_count=len(body_data.get("messages", [])))
 
         # Filter headers and enforce OAuth Authorization
         filtered_headers = filter_request_headers(headers, preserve_auth=False)
@@ -578,10 +579,16 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
         """Filter thinking blocks from message history before sending to API.
 
         Thinking blocks are returned by the API when extended thinking is enabled.
-        Rules:
-        - If thinking is enabled, the last assistant MUST start with a thinking block
-        - If the last assistant doesn't start with thinking, we must disable thinking
-          and remove ALL thinking blocks from the conversation
+
+        API Rules (critical):
+        - If thinking is enabled, last assistant MUST start with thinking block
+        - ANY assistant message with thinking blocks must have thinking as FIRST block
+        - Old assistant messages should NOT have thinking blocks (strip them)
+
+        Strategy:
+        - Last assistant: keep and reorder thinking blocks if valid
+        - Other assistants: REMOVE all thinking blocks
+        - User messages: REMOVE all thinking blocks
 
         Args:
             data: Request data dictionary
@@ -591,64 +598,132 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
         """
         import copy
 
-        # Deep copy to avoid modifying original
         clean_data = copy.deepcopy(data)
 
         messages = clean_data.get("messages", [])
         if not messages:
             return clean_data
 
-        # Check if thinking is enabled in the request
         thinking_config = clean_data.get("thinking")
         thinking_enabled = (
             isinstance(thinking_config, dict) and
             thinking_config.get("type") == "enabled"
         )
 
-        # Find the last assistant message
+        model = clean_data.get("model", "unknown")
+
+        # Find the last assistant message index
         last_assistant_idx = None
-        last_assistant_msg = None
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "assistant":
                 last_assistant_idx = i
-                last_assistant_msg = messages[i]
                 break
 
-        # Check if last assistant starts with a valid thinking block
-        last_assistant_has_valid_thinking = False
-        if last_assistant_msg:
-            content = last_assistant_msg.get("content")
+        # Check if last assistant has valid thinking (starts with thinking block)
+        last_assistant_valid = False
+        if last_assistant_idx is not None:
+            content = messages[last_assistant_idx].get("content")
             if isinstance(content, list) and content:
                 first_block = content[0]
-                last_assistant_has_valid_thinking = (
+                last_assistant_valid = (
                     isinstance(first_block, dict) and
                     first_block.get("type") in ("thinking", "redacted_thinking")
                 )
 
-        # If thinking is enabled but last assistant doesn't have valid thinking,
-        # we must disable thinking to avoid API errors
-        if thinking_enabled and not last_assistant_has_valid_thinking and last_assistant_msg:
+        # Trace info for debugging
+        assistant_info = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    block_types = [b.get("type", "?") if isinstance(b, dict) else "str" for b in content]
+                    has_thinking = any(t in ("thinking", "redacted_thinking") for t in block_types)
+                    if has_thinking:  # Only log assistants with thinking blocks
+                        assistant_info.append({
+                            "idx": i,
+                            "blocks": block_types[:5],  # First 5 blocks
+                            "first": block_types[0] if block_types else None,
+                            "is_last": i == last_assistant_idx
+                        })
+
+        logger.info(
+            "thinking_filter_trace",
+            model=model,
+            total_messages=len(messages),
+            thinking_enabled=thinking_enabled,
+            last_assistant_idx=last_assistant_idx,
+            last_assistant_valid=last_assistant_valid,
+            assistants_with_thinking=assistant_info,
+        )
+
+        # If thinking enabled but last assistant doesn't have valid thinking, disable
+        if thinking_enabled and last_assistant_idx is not None and not last_assistant_valid:
             clean_data["thinking"] = {"type": "disabled"}
             thinking_enabled = False
+            logger.info("thinking_auto_disabled", reason="last_assistant_invalid")
 
-        # Filter thinking blocks from all messages (except last assistant if valid)
+        # Process each message
         for i, message in enumerate(messages):
-            # If thinking is enabled and this is the last assistant with valid thinking, keep it
-            if thinking_enabled and i == last_assistant_idx and last_assistant_has_valid_thinking:
-                # Still need to filter thinking from OTHER assistant messages in the history
+            content = message.get("content")
+            if not isinstance(content, list):
                 continue
 
-            content = message.get("content")
-            if isinstance(content, list):
-                # Filter out thinking and redacted_thinking blocks
-                filtered_content = [
-                    block for block in content
-                    if not (isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"))
-                ]
-                # If all content was thinking blocks, keep at least an empty text block
-                if not filtered_content and content:
-                    filtered_content = [{"type": "text", "text": ""}]
-                message["content"] = filtered_content
+            role = message.get("role")
+            is_last_assistant = (i == last_assistant_idx and role == "assistant")
+
+            # Identify thinking blocks in this message
+            thinking_blocks = [
+                b for b in content
+                if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
+            ]
+            other_blocks = [
+                b for b in content
+                if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))
+            ]
+
+            has_thinking = len(thinking_blocks) > 0
+
+            if is_last_assistant and thinking_enabled and has_thinking:
+                # KEEP thinking blocks but reorder: thinking first
+                message["content"] = thinking_blocks + other_blocks
+                logger.info("thinking_kept_reordered", idx=i, thinking_count=len(thinking_blocks))
+            elif has_thinking:
+                # REMOVE all thinking blocks from this message
+                if other_blocks:
+                    message["content"] = other_blocks
+                else:
+                    # Can't have empty content, add placeholder
+                    message["content"] = [{"type": "text", "text": ""}]
+                logger.info(
+                    "thinking_removed",
+                    idx=i,
+                    role=role,
+                    removed=len(thinking_blocks),
+                    is_last_assistant=is_last_assistant,
+                )
+
+        # Final validation: ensure NO assistant has thinking blocks with wrong order
+        for i, message in enumerate(clean_data.get("messages", [])):
+            if message.get("role") == "assistant":
+                content = message.get("content")
+                if isinstance(content, list) and content:
+                    block_types = [b.get("type", "?") if isinstance(b, dict) else "str" for b in content]
+                    has_thinking = any(t in ("thinking", "redacted_thinking") for t in block_types)
+                    if has_thinking:
+                        first_type = block_types[0]
+                        if first_type not in ("thinking", "redacted_thinking"):
+                            # This should NEVER happen - if it does, strip thinking blocks
+                            logger.error(
+                                "thinking_validation_failed",
+                                idx=i,
+                                first_type=first_type,
+                                block_types=block_types[:5],
+                            )
+                            # Emergency fix: remove all thinking blocks
+                            message["content"] = [
+                                b for b in content
+                                if not (isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking"))
+                            ] or [{"type": "text", "text": ""}]
 
         return clean_data
 
