@@ -82,6 +82,22 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
 
         # Filter thinking blocks from message history (they should not be sent back to API)
         body_data = self._filter_thinking_blocks_from_history(body_data)
+
+        # Post-filter validation: log any remaining issues
+        for i, msg in enumerate(body_data.get("messages", [])):
+            if msg.get("role") == "assistant":
+                content = msg.get("content")
+                if isinstance(content, list) and content:
+                    types = [b.get("type") if isinstance(b, dict) else "str" for b in content]
+                    has_thinking = any(t in ("thinking", "redacted_thinking") for t in types)
+                    if has_thinking and types[0] not in ("thinking", "redacted_thinking"):
+                        logger.error(
+                            "POST_FILTER_INVALID",
+                            message_idx=i,
+                            first_type=types[0],
+                            all_types=types,
+                        )
+
         logger.info("thinking_blocks_filtered", message_count=len(body_data.get("messages", [])))
 
         # Filter headers and enforce OAuth Authorization
