@@ -80,6 +80,9 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
         # Remove internal metadata fields like _ccproxy_injected before sending to the API
         body_data = self._remove_metadata_fields(body_data)
 
+        # Filter thinking blocks from message history (they should not be sent back to API)
+        body_data = self._filter_thinking_blocks_from_history(body_data)
+
         # Filter headers and enforce OAuth Authorization
         filtered_headers = filter_request_headers(headers, preserve_auth=False)
         # Always set Authorization from OAuth-managed access token
@@ -568,6 +571,40 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
         for tool in tools:
             if isinstance(tool, dict) and "_ccproxy_injected" in tool:
                 del tool["_ccproxy_injected"]
+
+        return clean_data
+
+    def _filter_thinking_blocks_from_history(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Filter thinking blocks from message history before sending to API.
+
+        Thinking blocks are returned by the API when extended thinking is enabled,
+        but they must NOT be included when sending conversation history back.
+        The API rejects messages containing thinking blocks in the input.
+
+        Args:
+            data: Request data dictionary
+
+        Returns:
+            Cleaned data dictionary without thinking blocks in message content
+        """
+        import copy
+
+        # Deep copy to avoid modifying original
+        clean_data = copy.deepcopy(data)
+
+        messages = clean_data.get("messages", [])
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                # Filter out thinking and redacted_thinking blocks
+                filtered_content = [
+                    block for block in content
+                    if not (isinstance(block, dict) and block.get("type") in ("thinking", "redacted_thinking"))
+                ]
+                # If all content was thinking blocks, keep at least an empty text block
+                if not filtered_content and content:
+                    filtered_content = [{"type": "text", "text": ""}]
+                message["content"] = filtered_content
 
         return clean_data
 
