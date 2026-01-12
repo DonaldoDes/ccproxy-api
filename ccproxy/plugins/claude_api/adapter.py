@@ -577,15 +577,17 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
     def _filter_thinking_blocks_from_history(self, data: dict[str, Any]) -> dict[str, Any]:
         """Filter thinking blocks from message history before sending to API.
 
-        Thinking blocks are returned by the API when extended thinking is enabled,
-        but they must NOT be included when sending conversation history back.
-        The API rejects messages containing thinking blocks in the input.
+        Thinking blocks are returned by the API when extended thinking is enabled.
+        Rules:
+        - If thinking is enabled, the last assistant MUST start with a thinking block
+        - If the last assistant doesn't start with thinking, we must disable thinking
+          and remove ALL thinking blocks from the conversation
 
         Args:
             data: Request data dictionary
 
         Returns:
-            Cleaned data dictionary without thinking blocks in message content
+            Cleaned data dictionary with thinking blocks handled appropriately
         """
         import copy
 
@@ -593,7 +595,49 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
         clean_data = copy.deepcopy(data)
 
         messages = clean_data.get("messages", [])
-        for message in messages:
+        if not messages:
+            return clean_data
+
+        # Check if thinking is enabled in the request
+        thinking_config = clean_data.get("thinking")
+        thinking_enabled = (
+            isinstance(thinking_config, dict) and
+            thinking_config.get("type") == "enabled"
+        )
+
+        # Find the last assistant message
+        last_assistant_idx = None
+        last_assistant_msg = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "assistant":
+                last_assistant_idx = i
+                last_assistant_msg = messages[i]
+                break
+
+        # Check if last assistant starts with a valid thinking block
+        last_assistant_has_valid_thinking = False
+        if last_assistant_msg:
+            content = last_assistant_msg.get("content")
+            if isinstance(content, list) and content:
+                first_block = content[0]
+                last_assistant_has_valid_thinking = (
+                    isinstance(first_block, dict) and
+                    first_block.get("type") in ("thinking", "redacted_thinking")
+                )
+
+        # If thinking is enabled but last assistant doesn't have valid thinking,
+        # we must disable thinking to avoid API errors
+        if thinking_enabled and not last_assistant_has_valid_thinking and last_assistant_msg:
+            clean_data["thinking"] = {"type": "disabled"}
+            thinking_enabled = False
+
+        # Filter thinking blocks from all messages (except last assistant if valid)
+        for i, message in enumerate(messages):
+            # If thinking is enabled and this is the last assistant with valid thinking, keep it
+            if thinking_enabled and i == last_assistant_idx and last_assistant_has_valid_thinking:
+                # Still need to filter thinking from OTHER assistant messages in the history
+                continue
+
             content = message.get("content")
             if isinstance(content, list):
                 # Filter out thinking and redacted_thinking blocks

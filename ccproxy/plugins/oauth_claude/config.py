@@ -12,11 +12,11 @@ class ClaudeOAuthConfig(BaseModel):
     )
 
     base_url: str = Field(
-        default="https://console.anthropic.com",
+        default="https://platform.claude.com",
         description="Base URL for OAuth API endpoints",
     )
     token_url: str = Field(
-        default="https://console.anthropic.com/v1/oauth/token",
+        default="https://platform.claude.com/v1/oauth/token",
         description="OAuth token endpoint URL",
     )
     authorize_url: str = Field(
