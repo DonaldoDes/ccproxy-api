@@ -1,6 +1,7 @@
 import json
 import time
 import uuid
+from contextvars import ContextVar
 from typing import Any, cast
 
 import httpx
@@ -22,6 +23,9 @@ from .config import ClaudeAPISettings
 
 
 logger = get_plugin_logger()
+
+# Context variable for request tracing
+_request_trace_id: ContextVar[str] = ContextVar("request_trace_id", default="")
 
 
 class ClaudeAPIAdapter(BaseHTTPAdapter):
@@ -47,11 +51,19 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
     async def prepare_provider_request(
         self, body: bytes, headers: dict[str, str], endpoint: str
     ) -> tuple[bytes, dict[str, str]]:
+        # Generate unique trace ID for this request
+        trace_id = uuid.uuid4().hex[:8]
+        _request_trace_id.set(trace_id)
+
         # Get a valid access token (auto-refreshes if expired)
         token_value = await self._resolve_access_token()
 
         # Parse body
         body_data = json.loads(body.decode()) if body else {}
+
+        # Log incoming message count for tracing
+        incoming_count = len(body_data.get("messages", []))
+        logger.info("prepare_request_start", trace_id=trace_id, incoming_messages=incoming_count)
 
         # Anthropic API rejects null temperature fields, so strip them early
         if body_data.get("temperature") is None:
@@ -84,21 +96,38 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
         body_data = self._filter_thinking_blocks_from_history(body_data)
 
         # Post-filter validation: log any remaining issues
-        for i, msg in enumerate(body_data.get("messages", [])):
+        trace_id = _request_trace_id.get()
+        final_messages = body_data.get("messages", [])
+        final_count = len(final_messages)
+
+        # Detailed validation of all assistant messages
+        invalid_assistants = []
+        for i, msg in enumerate(final_messages):
             if msg.get("role") == "assistant":
                 content = msg.get("content")
                 if isinstance(content, list) and content:
                     types = [b.get("type") if isinstance(b, dict) else "str" for b in content]
                     has_thinking = any(t in ("thinking", "redacted_thinking") for t in types)
                     if has_thinking and types[0] not in ("thinking", "redacted_thinking"):
+                        invalid_assistants.append({
+                            "idx": i,
+                            "first_type": types[0],
+                            "all_types": types[:5]  # First 5 types
+                        })
                         logger.error(
                             "POST_FILTER_INVALID",
+                            trace_id=trace_id,
                             message_idx=i,
                             first_type=types[0],
                             all_types=types,
                         )
 
-        logger.info("thinking_blocks_filtered", message_count=len(body_data.get("messages", [])))
+        logger.info(
+            "thinking_blocks_filtered",
+            trace_id=trace_id,
+            message_count=final_count,
+            invalid_count=len(invalid_assistants),
+        )
 
         # Filter headers and enforce OAuth Authorization
         filtered_headers = filter_request_headers(headers, preserve_auth=False)
@@ -120,7 +149,39 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
                     continue
                 filtered_headers[lk] = value
 
-        return json.dumps(body_data).encode(), filtered_headers
+        # Serialize body
+        final_body = json.dumps(body_data).encode()
+
+        # Final validation: verify the serialized body has correct thinking block order
+        # This catches any edge cases or mutations we might have missed
+        try:
+            verify_data = json.loads(final_body.decode())
+            verify_messages = verify_data.get("messages", [])
+            for i, msg in enumerate(verify_messages):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content")
+                    if isinstance(content, list) and content:
+                        types = [b.get("type") if isinstance(b, dict) else "str" for b in content]
+                        has_thinking = any(t in ("thinking", "redacted_thinking") for t in types)
+                        if has_thinking and types[0] not in ("thinking", "redacted_thinking"):
+                            logger.error(
+                                "FINAL_BODY_INVALID",
+                                trace_id=trace_id,
+                                message_idx=i,
+                                first_type=types[0],
+                                total_messages=len(verify_messages),
+                            )
+        except Exception as e:
+            logger.error("FINAL_BODY_VERIFY_ERROR", trace_id=trace_id, error=str(e))
+
+        logger.info(
+            "prepare_request_complete",
+            trace_id=trace_id,
+            final_messages=len(body_data.get("messages", [])),
+            body_size=len(final_body),
+        )
+
+        return final_body, filtered_headers
 
     async def process_provider_response(
         self, response: httpx.Response, endpoint: str
@@ -662,8 +723,10 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
                             "is_last": i == last_assistant_idx
                         })
 
+        trace_id = _request_trace_id.get()
         logger.info(
             "thinking_filter_trace",
+            trace_id=trace_id,
             model=model,
             total_messages=len(messages),
             thinking_enabled=thinking_enabled,
@@ -676,7 +739,7 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
         if thinking_enabled and last_assistant_idx is not None and not last_assistant_valid:
             clean_data["thinking"] = {"type": "disabled"}
             thinking_enabled = False
-            logger.info("thinking_auto_disabled", reason="last_assistant_invalid")
+            logger.info("thinking_auto_disabled", trace_id=trace_id, reason="last_assistant_invalid")
 
         # Process each message
         for i, message in enumerate(messages):
@@ -702,7 +765,7 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
             if is_last_assistant and thinking_enabled and has_thinking:
                 # KEEP thinking blocks but reorder: thinking first
                 message["content"] = thinking_blocks + other_blocks
-                logger.info("thinking_kept_reordered", idx=i, thinking_count=len(thinking_blocks))
+                logger.info("thinking_kept_reordered", trace_id=trace_id, idx=i, thinking_count=len(thinking_blocks))
             elif has_thinking:
                 # REMOVE all thinking blocks from this message
                 if other_blocks:
@@ -712,6 +775,7 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
                     message["content"] = [{"type": "text", "text": ""}]
                 logger.info(
                     "thinking_removed",
+                    trace_id=trace_id,
                     idx=i,
                     role=role,
                     removed=len(thinking_blocks),
@@ -731,6 +795,7 @@ class ClaudeAPIAdapter(BaseHTTPAdapter):
                             # This should NEVER happen - if it does, strip thinking blocks
                             logger.error(
                                 "thinking_validation_failed",
+                                trace_id=trace_id,
                                 idx=i,
                                 first_type=first_type,
                                 block_types=block_types[:5],
