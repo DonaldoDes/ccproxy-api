@@ -233,6 +233,26 @@ class BaseHTTPAdapter(BaseAdapter):
             prepared_headers=prepared_headers,
             is_streaming=False,
         )
+        # DEBUG: Dump body right before sending to API (after hooks)
+        try:
+            import tempfile
+            import os
+            debug_file = os.path.join(tempfile.gettempdir(), "ccproxy_ACTUAL_SEND.json")
+            parsed = json.loads(prepared_body.decode()) if prepared_body else {}
+            debug_data = {
+                "stage": "ACTUAL_SEND",
+                "thinking_config": parsed.get("thinking"),
+                "assistant_messages": [
+                    {"idx": i, "content_types": [b.get("type") if isinstance(b, dict) else "?" for b in m.get("content", [])]}
+                    for i, m in enumerate(parsed.get("messages", []))
+                    if m.get("role") == "assistant"
+                ]
+            }
+            with open(debug_file, "w") as f:
+                json.dump(debug_data, f, indent=2)
+        except Exception:
+            pass
+
         provider_response = await self._execute_http_request(
             method,
             target_url,
@@ -552,6 +572,51 @@ class BaseHTTPAdapter(BaseAdapter):
             prepared_headers=prepared_headers,
             is_streaming=True,
         )
+
+        # DEBUG: Dump FULL body right before sending to API
+        try:
+            import tempfile
+            import os
+            import time
+            ts = int(time.time() * 1000)
+            parsed = json.loads(prepared_body.decode()) if prepared_body else {}
+
+            # Check for problematic thinking blocks
+            has_problem = False
+            for i, m in enumerate(parsed.get("messages", [])):
+                if m.get("role") == "assistant":
+                    content = m.get("content", [])
+                    if isinstance(content, list) and content:
+                        types = [b.get("type") if isinstance(b, dict) else "?" for b in content]
+                        has_thinking = any(t in ("thinking", "redacted_thinking") for t in types)
+                        if has_thinking and types[0] not in ("thinking", "redacted_thinking"):
+                            has_problem = True
+                            # Dump problematic request with unique filename
+                            problem_file = os.path.join(tempfile.gettempdir(), f"ccproxy_PROBLEM_{ts}.json")
+                            with open(problem_file, "wb") as f:
+                                f.write(prepared_body)
+
+            # Always dump the latest RAW body
+            raw_file = os.path.join(tempfile.gettempdir(), "ccproxy_RAW_BODY.json")
+            with open(raw_file, "wb") as f:
+                f.write(prepared_body)
+
+            # Log summary with problem flag
+            debug_data = {
+                "stage": "ACTUAL_SEND_STREAMING",
+                "timestamp": ts,
+                "has_thinking_problem": has_problem,
+                "thinking_config": parsed.get("thinking"),
+                "all_messages": [
+                    {"idx": i, "role": m.get("role"), "content_types": [b.get("type") if isinstance(b, dict) else "?" for b in (m.get("content") if isinstance(m.get("content"), list) else [])]}
+                    for i, m in enumerate(parsed.get("messages", []))
+                ]
+            }
+            log_file = os.path.join(tempfile.gettempdir(), "ccproxy_ALL_SENDS.log")
+            with open(log_file, "a") as f:
+                f.write(json.dumps(debug_data) + "\n")
+        except Exception:
+            pass
 
         # Get HTTP client from pool manager with base URL for hook integration
         parsed_url = urlparse(target_url)

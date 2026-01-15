@@ -105,6 +105,20 @@ class DeferredStreaming(StreamingResponse):
                     )
                     self._stream_accumulator = None
 
+        # DEBUG: Log body right before httpx send
+        try:
+            import tempfile
+            import os
+            import json
+            import time
+            ts = int(time.time() * 1000)
+            body_bytes = bytes(self.body) if isinstance(self.body, memoryview) else self.body
+            debug_file = os.path.join(tempfile.gettempdir(), f"ccproxy_HTTPX_SEND_{ts}.json")
+            with open(debug_file, "wb") as f:
+                f.write(body_bytes)
+        except Exception:
+            pass
+
         # Start the streaming request
         async with self.client.stream(
             method=self.method,
