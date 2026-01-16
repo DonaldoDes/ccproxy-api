@@ -23,6 +23,14 @@ DEFAULT_CLAUDE_MODEL_CARDS: list[ModelCard] = [
         parent=None,
     ),
     ModelCard(
+        id="claude-opus-4-5-20251101",
+        created=1730419200,
+        owned_by="anthropic",
+        permission=[],
+        root="claude-opus-4-5-20251101",
+        parent=None,
+    ),
+    ModelCard(
         id="claude-opus-4-1-20250805",
         created=1722816000,
         owned_by="anthropic",
